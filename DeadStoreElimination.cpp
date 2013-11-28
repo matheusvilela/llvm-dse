@@ -37,7 +37,7 @@ DeadStoreEliminationPass::~DeadStoreEliminationPass() {
 bool DeadStoreEliminationPass::changeLinkageTypes(Module &M) {
   for (Module::global_iterator git = M.global_begin(), gitE = M.global_end();
         git != gitE; ++git) {
-    DEBUG(errs() << "Changing linkage of " << git << "\n");
+    DEBUG(errs() << "Changing linkage of " << *git << "\n");
     git->setLinkage(GlobalValue::PrivateLinkage);
   }
   for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F) {
@@ -57,6 +57,7 @@ bool DeadStoreEliminationPass::runOnModule(Module &M) {
   globalsAST = new AliasSetTracker(*AA);
 
   getFnThatStoreOnArgs(M);
+  getGlobalValuesInfo(M);
 
   for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F) {
     if (!F->isDeclaration()) {
@@ -65,7 +66,6 @@ bool DeadStoreEliminationPass::runOnModule(Module &M) {
       runOverwrittenDeadStoreAnalysis(*F);
     }
   }
-  getGlobalValuesInfo(M);
   runNotUsedDeadStoreAnalysis();
   changed = changed | cloneFunctions();
   return changed;
@@ -86,6 +86,8 @@ void DeadStoreEliminationPass::getGlobalValuesInfo(Module &M) {
 
 /*
  * Build information about functions that store on pointer arguments
+ * For simplification, we only consider a function to store on an argument
+ * if it has exactly one StoreInst to that argument and the arg has no other use.
  */
 void DeadStoreEliminationPass::getFnThatStoreOnArgs(Module &M) {
   for (Module::iterator F = M.begin(); F != M.end(); ++F) {
@@ -93,14 +95,14 @@ void DeadStoreEliminationPass::getFnThatStoreOnArgs(Module &M) {
 
     // Get args
     std::set<Value*> args;
-    for (Function::arg_iterator formalArgIter = F->arg_begin(); formalArgIter !=
-        F->arg_end(); ++formalArgIter) {
+    for (Function::arg_iterator formalArgIter = F->arg_begin();
+          formalArgIter != F->arg_end(); ++formalArgIter) {
       Value *formalArg = formalArgIter;
       if (formalArg->getType()->isPointerTy()) {
         args.insert(formalArg);
       }
     }
-   
+
     // Find stores on arguments
     for (Function::iterator BB = F->begin(); BB != F->end(); ++BB) {
       for (BasicBlock::iterator I = BB->begin(); I != BB->end(); ++I) {
@@ -111,22 +113,30 @@ void DeadStoreEliminationPass::getFnThatStoreOnArgs(Module &M) {
 
         if (args.count(ptrOp) && ptrOp->hasNUses(1)) {
           fnThatStoreOnArgs[F].insert(ptrOp);
-          DEBUG(errs() << "Function " << F->getName() << " stores on argument " << ptrOp->getName() << "\n");
-        }
+          DEBUG(errs() << "Function " << F->getName() << " stores on argument "
+                << ptrOp->getName() << "\n"); }
       }
     }
   }
 }
 
+/*
+ * Find stores to arguments that are not read on the caller function. If the
+ * corresponding actual argument is locally declared on the caller, the
+ * store can be removed with cloning.
+ */
 void DeadStoreEliminationPass::runNotUsedDeadStoreAnalysis() {
 
   DEBUG(errs() << "Running not used analysis\n");
-  for(std::map<Function*, std::set<Value*> >::iterator it = fnThatStoreOnArgs.begin();
-      it != fnThatStoreOnArgs.end(); ++it) {
+  for(std::map<Function*, std::set<Value*> >::iterator it =
+        fnThatStoreOnArgs.begin(); it != fnThatStoreOnArgs.end(); ++it) {
     Function* F = it->first;
     DEBUG(errs() << "Verifying function " << F->getName() << "\n");
-    for (Value::use_iterator UI = F->use_begin(), E = F->use_end(); UI != E; ++UI) {
-      User *U = *UI;
+
+    // Verify each callsite of functions that store on arguments
+    for (Value::use_iterator UI = F->use_begin(), E = F->use_end();
+          UI != E; ++UI) {
+       User *U = *UI;
 
       if (isa<BlockAddress>(U)) continue;
       if (!isa<CallInst>(U) && !isa<InvokeInst>(U)) continue;
@@ -145,10 +155,14 @@ void DeadStoreEliminationPass::runNotUsedDeadStoreAnalysis() {
       for (int i = 0; i < size; ++i, ++actualArgIter, ++formalArgIter) {
         Value *formalArg = formalArgIter;
         Value *actualArg = *actualArgIter;
+
+        // Find out if this store may be read within the caller
         if (storedArgs.count(formalArg)) {
-          DEBUG(errs() << "store on " << formalArg->getName() << " may be removed with cloning on instruction " << *inst << "\n");
+          DEBUG(errs() << "store on " << formalArg->getName()
+                << " may be removed with cloning on instruction " << *inst << "\n");
           if (!isa<AllocaInst>(actualArg)) {
             DEBUG(errs() << "Cant remove because actual arg was not locally allocated.\n");
+            //FIXME: handle malloc and other allocation functions
             continue;
           }
           if (aliasExternalValues(actualArg, *inst->getParent()->getParent())) {
@@ -163,9 +177,22 @@ void DeadStoreEliminationPass::runNotUsedDeadStoreAnalysis() {
   }
 }
 
+/*
+ * Verify if a given value alias the arguments of the function where it's
+ * used or global values.
+ */
 bool DeadStoreEliminationPass::aliasExternalValues(Value *v, Function &F) {
 
-  // Make set with arguments
+  // Verify if value alias globals
+  AliasSetTracker* ast = new AliasSetTracker(*AA);
+  ast->add(*globalsAST);
+  DEBUG(errs() << "global ast:\n");
+  DEBUG(printSet(errs(), *ast));
+  bool aliasGlobals = !ast->add(v, getPointerSize(v, *AA), NULL);
+  DEBUG(printSet(errs(), *ast));
+  delete ast;
+
+  // Make AliasSetTracker with pointer arguments
   AliasSetTracker* argAST = new AliasSetTracker(*AA);
   for (Function::arg_iterator formalArgIter = F.arg_begin(); formalArgIter !=
       F.arg_end(); ++formalArgIter) {
@@ -176,23 +203,15 @@ bool DeadStoreEliminationPass::aliasExternalValues(Value *v, Function &F) {
   }
 
   // Verify if value alias args
-  AliasSetTracker* ast = new AliasSetTracker(*AA);
+  ast = new AliasSetTracker(*AA);
   ast->add(*argAST);
   DEBUG(errs() << "arg ast:\n");
-  printSet(errs(), *ast);
+  DEBUG(printSet(errs(), *ast));
+  DEBUG(errs() << "Adding value " << *v << ", with size " << getPointerSize(v, *AA) << "\n");
   bool aliasArgs = !ast->add(v, getPointerSize(v, *AA), NULL);
-  printSet(errs(), *ast);
+  DEBUG(printSet(errs(), *ast));
   delete ast;
   delete argAST;
-
-  // Verify if value alias globals
-  ast = new AliasSetTracker(*AA);
-  DEBUG(errs() << "global ast:\n");
-  ast->add(*globalsAST);
-  printSet(errs(), *ast);
-  bool aliasGlobals = !ast->add(v, getPointerSize(v, *AA), NULL);
-  printSet(errs(), *ast);
-  delete ast;
 
   if (aliasArgs) DEBUG(errs() << "Value " << *v << " cannot be removed due to alias args.\n");
   if (aliasGlobals) DEBUG(errs() << "Value " << *v << " cannot be removed due to alias globals.\n");
@@ -200,8 +219,10 @@ bool DeadStoreEliminationPass::aliasExternalValues(Value *v, Function &F) {
   return (aliasArgs || aliasGlobals);
 }
 
+/*
+ * Find stores to arguments that are overwritten before being read.
+ */
 void DeadStoreEliminationPass::runOverwrittenDeadStoreAnalysis(Function &F) {
-  //DEBUG(errs() << "Running on Function " << F.getName() << "\n");
   MDA       = &getAnalysis<MemoryDependenceAnalysis>(F);
 
   for (Function::iterator BB = F.begin(), E = F.end(); BB != E; ++BB) {
@@ -211,7 +232,6 @@ void DeadStoreEliminationPass::runOverwrittenDeadStoreAnalysis(Function &F) {
         Value *ptr           = SI->getPointerOperand();
         MemDepResult mdr     = MDA->getDependency(inst);
         Instruction *depInst = mdr.getInst();
-        DEBUG(errs() << "Store inst " << *inst << " depends on " << *mdr.getInst() << "\n");
         if (depInst && (isa<CallInst>(depInst) || isa<InvokeInst>(depInst))) {
            Function *calledFn;
 
@@ -233,13 +253,16 @@ void DeadStoreEliminationPass::runOverwrittenDeadStoreAnalysis(Function &F) {
            for (int i = 0; i < size; ++i, ++actualArgIter, ++formalArgIter) {
              Value *formalArg = formalArgIter;
              Value *actualArg = *actualArgIter;
-             //TODO: be sure that the store on the caller fully overwrites the store on the callee
+             //FIXME: be sure that the store on the caller fully overwrites the
+             //store on the callee
              if (ptr == actualArg && storedArgs.count(formalArg)) {
                DEBUG(errs() << "store on " << formalArg->getName() << " should be removed with cloning\n");
                deadArguments[depInst].insert(formalArg);
              }
            }
-           if (deadArguments.count(depInst)) fn2Clone[calledFn].push_back(depInst);
+           if (deadArguments.count(depInst)) {
+             fn2Clone[calledFn].push_back(depInst);
+           }
         }
       }
     }
@@ -251,8 +274,8 @@ void DeadStoreEliminationPass::runOverwrittenDeadStoreAnalysis(Function &F) {
  */
 bool DeadStoreEliminationPass::cloneFunctions() {
   bool modified = false;
-  for (std::map<Function*, std::vector<Instruction*> >::iterator it = fn2Clone.begin();
-      it != fn2Clone.end(); ++it) {
+  for (std::map<Function*, std::vector<Instruction*> >::iterator it =
+      fn2Clone.begin(); it != fn2Clone.end(); ++it) {
 
     Function *F = it->first;
     std::vector<Instruction*> callSitesToClone = it->second;
@@ -288,14 +311,16 @@ bool DeadStoreEliminationPass::cloneFunctions() {
 /*
  * Clone a given function removing dead stores
  */
-Function* DeadStoreEliminationPass::cloneFunctionWithoutDeadStore(Function *Fn, Instruction* caller, std::string suffix) {
+Function* DeadStoreEliminationPass::cloneFunctionWithoutDeadStore(Function *Fn,
+    Instruction* caller, std::string suffix) {
 
   Function *NF = Function::Create(Fn->getFunctionType(), Fn->getLinkage());
   NF->copyAttributesFrom(Fn);
 
   // Copy the parameter names, to ease function inspection afterwards.
   Function::arg_iterator NFArg = NF->arg_begin();
-  for (Function::arg_iterator Arg = Fn->arg_begin(), ArgEnd = Fn->arg_end(); Arg != ArgEnd; ++Arg, ++NFArg) {
+  for (Function::arg_iterator Arg = Fn->arg_begin(), ArgEnd = Fn->arg_end();
+      Arg != ArgEnd; ++Arg, ++NFArg) {
     NFArg->setName(Arg->getName());
   }
 
@@ -342,7 +367,7 @@ Function* DeadStoreEliminationPass::cloneFunctionWithoutDeadStore(Function *Fn, 
     inst->eraseFromParent();
     RemovedStores++;
   }
- 
+
   // Insert the clone function before the original
   Fn->getParent()->getFunctionList().insert(Fn, NF);
 
@@ -352,7 +377,8 @@ Function* DeadStoreEliminationPass::cloneFunctionWithoutDeadStore(Function *Fn, 
 /*
  * Replace called function of a given call site.
  */
-void DeadStoreEliminationPass::replaceCallingInst(Instruction* caller, Function* fn) {
+void DeadStoreEliminationPass::replaceCallingInst(Instruction* caller,
+    Function* fn) {
   if (isa<CallInst>(caller)) {
     CallInst *callInst = dyn_cast<CallInst>(caller);
     callInst->setCalledFunction(fn);
@@ -363,9 +389,11 @@ void DeadStoreEliminationPass::replaceCallingInst(Instruction* caller, Function*
 }
 
 
-void DeadStoreEliminationPass::printSet(raw_ostream &O, AliasSetTracker &myset) const {
+void DeadStoreEliminationPass::printSet(raw_ostream &O,
+    AliasSetTracker &myset) const {
   O << "       { ";
-  for (AliasSetTracker::const_iterator it = myset.begin(); it != myset.end(); ++it) {
+  for (AliasSetTracker::const_iterator it = myset.begin();
+      it != myset.end(); ++it) {
     (*it).print(O);
   }
   O << "}\n";
