@@ -51,14 +51,15 @@ namespace llvm {
     bool changeLinkageTypes(Module &M);
     bool cloneFunctions();
     bool runOnModule(Module &M);
+    int getFnThatStoreOnArgs(Module &M);
     virtual void getAnalysisUsage(AnalysisUsage &AU) const;
-    void getFnThatStoreOnArgs(Module &M);
     void getGlobalValuesInfo(Module &M);
     void print(raw_ostream &O, const Module *M) const;
     void printSet(raw_ostream &O, AliasSetTracker &myset) const;
     void replaceCallingInst(Instruction* caller, Function* fn);
     void runNotUsedDeadStoreAnalysis();
-    void runOverwrittenDeadStoreAnalysis(Function &F);
+    void runOverwrittenDeadStoreAnalysis(Module &M);
+    void runOverwrittenDeadStoreAnalysisOnFn(Function &F);
   };
   char DeadStoreEliminationPass::ID = 0;
 }
