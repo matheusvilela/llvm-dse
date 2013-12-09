@@ -13,6 +13,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Analysis/MemoryDependenceAnalysis.h"
+#include "llvm/Analysis/ValueTracking.h"
 
 namespace llvm {
   STATISTIC(RemovedStores,   "Number of removed stores.");
@@ -22,7 +23,13 @@ namespace llvm {
   STATISTIC(CallsCount,      "Total number of calls.");
   STATISTIC(PromissorCalls,  "Number of promissor calls.");
   STATISTIC(CallsReplaced,   "Number of calls replaced.");
- 
+
+  enum OverwriteResult {
+    OverwriteComplete,
+    OverwriteEnd,
+    OverwriteUnknown
+  };
+
   class DeadStoreEliminationPass : public ModulePass {
 
     // Functions that store on arguments
@@ -34,20 +41,22 @@ namespace llvm {
     // Function to be cloned
     std::map<Function*, std::vector<Instruction*> > fn2Clone;
 
-    AliasAnalysis *AA;
-    MemoryDependenceAnalysis *MDA;
-
     // VisitedPHIs - The set of PHI nodes visited when determining
     /// if a variable's reference has been taken.  This set
     /// is maintained to ensure we don't visit the same PHI node multiple
     /// times.
     SmallPtrSet<const PHINode*, 16> VisitedPHIs;
+
+    AliasAnalysis *AA;
+    MemoryDependenceAnalysis *MDA;
+
    public:
     static char ID;
 
     DeadStoreEliminationPass();
 
     Function* cloneFunctionWithoutDeadStore(Function *Fn, Instruction* caller, std::string suffix);
+    OverwriteResult isOverwrite(const AliasAnalysis::Location &Later, const AliasAnalysis::Location &Earlier, AliasAnalysis &AA, int64_t &EarlierOff, int64_t &LaterOff);
     bool changeLinkageTypes(Module &M);
     bool cloneFunctions();
     bool hasAddressTaken(const Instruction *AI, CallSite& CS);

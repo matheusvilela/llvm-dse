@@ -316,11 +316,15 @@ void DeadStoreEliminationPass::runOverwrittenDeadStoreAnalysisOnFn(Function &F) 
            for (int i = 0; i < size; ++i, ++actualArgIter, ++formalArgIter) {
              Value *formalArg = formalArgIter;
              Value *actualArg = *actualArgIter;
-             //FIXME: be sure that the store on the caller fully overwrites the
-             //store on the callee
              if (ptr == actualArg && storedArgs.count(formalArg)) {
-               DEBUG(errs() << "  Store on " << formalArg->getName() << " will be removed with cloning\n");
-               deadArguments[depInst].insert(formalArg);
+               int64_t InstWriteOffset, DepWriteOffset;
+               AliasAnalysis::Location Loc(ptr, getPointerSize(ptr, *AA), NULL);
+               AliasAnalysis::Location DepLoc(actualArg, getPointerSize(actualArg, *AA), NULL);
+               OverwriteResult OR = isOverwrite(Loc, DepLoc, *AA, DepWriteOffset, InstWriteOffset);
+               if (OR == OverwriteComplete) {
+                 DEBUG(errs() << "  Store on " << formalArg->getName() << " will be removed with cloning\n");
+                 deadArguments[depInst].insert(formalArg);
+               }
              }
            }
            if (deadArguments.count(depInst)) {
@@ -332,6 +336,114 @@ void DeadStoreEliminationPass::runOverwrittenDeadStoreAnalysisOnFn(Function &F) 
   }
 }
 
+/// isOverwrite - Return 'OverwriteComplete' if a store to the 'Later' location
+/// completely overwrites a store to the 'Earlier' location.
+/// 'OverwriteEnd' if the end of the 'Earlier' location is completely
+/// overwritten by 'Later', or 'OverwriteUnknown' if nothing can be determined
+OverwriteResult DeadStoreEliminationPass::isOverwrite(const AliasAnalysis::Location &Later,
+    const AliasAnalysis::Location &Earlier,
+    AliasAnalysis &AA,
+    int64_t &EarlierOff,
+    int64_t &LaterOff) {
+  const Value *P1 = Earlier.Ptr->stripPointerCasts();
+  const Value *P2 = Later.Ptr->stripPointerCasts();
+
+  // If the start pointers are the same, we just have to compare sizes to see if
+  // the later store was larger than the earlier store.
+  if (P1 == P2) {
+    // If we don't know the sizes of either access, then we can't do a
+    // comparison.
+    if (Later.Size == AliasAnalysis::UnknownSize ||
+        Earlier.Size == AliasAnalysis::UnknownSize) {
+      // If we have no DataLayout information around, then the size of the store
+      // is inferrable from the pointee type.  If they are the same type, then
+      // we know that the store is safe.
+      if (AA.getDataLayout() == 0 &&
+          Later.Ptr->getType() == Earlier.Ptr->getType())
+        return OverwriteComplete;
+
+      return OverwriteUnknown;
+    }
+
+    // Make sure that the Later size is >= the Earlier size.
+    if (Later.Size >= Earlier.Size)
+      return OverwriteComplete;
+  }
+
+  // Otherwise, we have to have size information, and the later store has to be
+  // larger than the earlier one.
+  if (Later.Size == AliasAnalysis::UnknownSize ||
+      Earlier.Size == AliasAnalysis::UnknownSize ||
+      AA.getDataLayout() == 0)
+    return OverwriteUnknown;
+
+  // Check to see if the later store is to the entire object (either a global,
+  // an alloca, or a byval argument).  If so, then it clearly overwrites any
+  // other store to the same object.
+  const DataLayout *TD = AA.getDataLayout();
+
+  const Value *UO1 = GetUnderlyingObject(P1, TD),
+        *UO2 = GetUnderlyingObject(P2, TD);
+
+  // If we can't resolve the same pointers to the same object, then we can't
+  // analyze them at all.
+  if (UO1 != UO2)
+    return OverwriteUnknown;
+
+  // If the "Later" store is to a recognizable object, get its size.
+  uint64_t ObjectSize = getPointerSize(UO2, AA);
+  if (ObjectSize != AliasAnalysis::UnknownSize)
+    if (ObjectSize == Later.Size && ObjectSize >= Earlier.Size)
+      return OverwriteComplete;
+
+  // Okay, we have stores to two completely different pointers.  Try to
+  // decompose the pointer into a "base + constant_offset" form.  If the base
+  // pointers are equal, then we can reason about the two stores.
+  EarlierOff = 0;
+  LaterOff = 0;
+  const Value *BP1 = GetPointerBaseWithConstantOffset(P1, EarlierOff, TD);
+  const Value *BP2 = GetPointerBaseWithConstantOffset(P2, LaterOff, TD);
+
+  // If the base pointers still differ, we have two completely different stores.
+  if (BP1 != BP2)
+    return OverwriteUnknown;
+
+  // The later store completely overlaps the earlier store if:
+  //
+  // 1. Both start at the same offset and the later one's size is greater than
+  //    or equal to the earlier one's, or
+  //
+  //      |--earlier--|
+  //      |--   later   --|
+  //
+  // 2. The earlier store has an offset greater than the later offset, but which
+  //    still lies completely within the later store.
+  //
+  //        |--earlier--|
+  //    |-----  later  ------|
+  //
+  // We have to be careful here as *Off is signed while *.Size is unsigned.
+  if (EarlierOff >= LaterOff &&
+      Later.Size >= Earlier.Size &&
+      uint64_t(EarlierOff - LaterOff) + Earlier.Size <= Later.Size)
+    return OverwriteComplete;
+
+  // The other interesting case is if the later store overwrites the end of
+  // the earlier store
+  //
+  //      |--earlier--|
+  //                |--   later   --|
+  //
+  // In this case we may want to trim the size of earlier to avoid generating
+  // writes to addresses which will definitely be overwritten later
+  if (LaterOff > EarlierOff &&
+      LaterOff < int64_t(EarlierOff + Earlier.Size) &&
+      int64_t(LaterOff + Later.Size) >= int64_t(EarlierOff + Earlier.Size))
+    return OverwriteEnd;
+
+  // Otherwise, they don't completely overlap.
+  return OverwriteUnknown;
+}
 /*
  * Clone functions, removing dead stores
  */
