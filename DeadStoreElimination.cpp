@@ -30,10 +30,31 @@ DeadStoreEliminationPass::DeadStoreEliminationPass() : ModulePass(ID) {
   PromissorCalls  = 0; //FIXME: get this stats
   CallsReplaced   = 0;
 }
-DeadStoreEliminationPass::~DeadStoreEliminationPass() {
-  delete globalsAST;
+
+
+bool DeadStoreEliminationPass::runOnModule(Module &M) {
+
+  if (!getFnThatStoreOnArgs(M)) {
+    return false;
+  }
+
+  bool changed = false;
+
+  changed    = changed | changeLinkageTypes(M);
+  AA         = &getAnalysis<AliasAnalysis>();
+
+  // Analyse program
+  runOverwrittenDeadStoreAnalysis(M);
+  runNotUsedDeadStoreAnalysis();
+
+  // Create clones
+  changed = changed | cloneFunctions();
+  return changed;
 }
 
+/* Change linkages of global values, in order to
+ * improve alias analysis.
+ */
 bool DeadStoreEliminationPass::changeLinkageTypes(Module &M) {
   DEBUG(errs() << "Changing linkages to private...\n");
   for (Module::global_iterator git = M.global_begin(), gitE = M.global_end();
@@ -49,41 +70,6 @@ bool DeadStoreEliminationPass::changeLinkageTypes(Module &M) {
   }
   DEBUG(errs() << "\n");
   return true;
-}
-
-bool DeadStoreEliminationPass::runOnModule(Module &M) {
-
-  if (!getFnThatStoreOnArgs(M)) {
-    return false;
-  }
-
-  bool changed = false;
-
-  changed    = changed | changeLinkageTypes(M);
-  AA         = &getAnalysis<AliasAnalysis>();
-  globalsAST = new AliasSetTracker(*AA);
-
-  // Analyse program
-  getGlobalValuesInfo(M);
-  runOverwrittenDeadStoreAnalysis(M);
-  runNotUsedDeadStoreAnalysis();
-
-  // Create clones
-  changed = changed | cloneFunctions();
-  return changed;
-}
-
-/*
- * Create an AST containing all global values that have pointer type
- */
-void DeadStoreEliminationPass::getGlobalValuesInfo(Module &M) {
-  for (Module::global_iterator git = M.global_begin(), gitE = M.global_end();
-        git != gitE; ++git) {
-    Value* v = git;
-    if (v->getType()->isPointerTy()) {
-      globalsAST->add(v, getPointerSize(v, *AA), NULL);
-    }
-  }
 }
 
 /*
@@ -163,22 +149,29 @@ void DeadStoreEliminationPass::runNotUsedDeadStoreAnalysis() {
         Value *formalArg = formalArgIter;
         Value *actualArg = *actualArgIter;
 
-        // Find out if this store may be read within the caller
         if (storedArgs.count(formalArg)) {
           DEBUG(errs() << "    Store on " << formalArg->getName()
                 << " may be removed with cloning on instruction " << *inst << "\n");
-          if (!isa<AllocaInst>(actualArg)) {
+          //TODO: handle malloc and other allocation functions
+          Instruction* argDeclaration = dyn_cast<Instruction>(actualArg);
+          if (!argDeclaration || !isa<AllocaInst>(argDeclaration)) {
             DEBUG(errs() << "    Can't remove because actual arg was not locally allocated.\n");
-            //FIXME: handle malloc and other allocation functions
             continue;
           }
-          if (aliasExternalValues(actualArg, *inst->getParent()->getParent())) {
-            DEBUG(errs() << "    Can't remove because actual arg alias globals or args.\n");
+          if (hasAddressTaken(argDeclaration, CS)) {
+            DEBUG(errs() << "    Can't remove because actual arg has its address taken.\n");
             continue;
           }
-          DEBUG(errs() << "    Can I remove it?\n");
-          //TODO: verify if there are any uses of the returned value
+          if (isRefAfterCallSite(actualArg, CS)) {
+            DEBUG(errs() << "    Can't remove because actual arg is used after callSite.\n");
+            continue;
+          }
+          DEBUG(errs() << "  Store on " << formalArg->getName() << " will be removed with cloning\n");
+          deadArguments[inst].insert(formalArg);
         }
+      }
+      if (deadArguments.count(inst)) {
+        fn2Clone[F].push_back(inst);
       }
     }
   }
@@ -186,43 +179,96 @@ void DeadStoreEliminationPass::runNotUsedDeadStoreAnalysis() {
 }
 
 /*
- * Verify if a given value alias the arguments of the function where it's
- * used or global values.
+ * Check if a given instruction has its address taken.
  */
-bool DeadStoreEliminationPass::aliasExternalValues(Value *v, Function &F) {
+bool DeadStoreEliminationPass::hasAddressTaken(const Instruction *AI, CallSite& CS) {
+  const Instruction* callInst = CS.getInstruction();
+  for (Value::const_use_iterator UI = AI->use_begin(), UE = AI->use_end();
+      UI != UE; ++UI) {
+    const User *U = *UI;
+    if (const StoreInst *SI = dyn_cast<StoreInst>(U)) {
+      if (AI == SI->getValueOperand())
+        return true;
+    } else if (const PtrToIntInst *SI = dyn_cast<PtrToIntInst>(U)) {
+      if (AI == SI->getOperand(0))
+        return true;
+    } else if (isa<CallInst>(U) && dyn_cast<Instruction>(U) != callInst) {
+      return true;
+    } else if (isa<InvokeInst>(U) && dyn_cast<Instruction>(U) != callInst) {
+      return true;
+    } else if (const SelectInst *SI = dyn_cast<SelectInst>(U)) {
+      if (hasAddressTaken(SI, CS))
+        return true;
+    } else if (const PHINode *PN = dyn_cast<PHINode>(U)) {
+      // Keep track of what PHI nodes we have already visited to ensure
+      // they are only visited once.
+      if (VisitedPHIs.insert(PN))
+        if (hasAddressTaken(PN, CS))
+          return true;
+    } else if (const GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(U)) {
+      if (hasAddressTaken(GEP, CS))
+        return true;
+    } else if (const BitCastInst *BI = dyn_cast<BitCastInst>(U)) {
+      if (hasAddressTaken(BI, CS))
+        return true;
+    }
+  }
+  return false;
+}
 
-  // Verify if value alias globals
-  AliasSetTracker* ast = new AliasSetTracker(*AA);
-  ast->add(*globalsAST);
-  bool aliasGlobals = !ast->add(v, getPointerSize(v, *AA), NULL);
-  DEBUG(errs() << "    Global+value AST:\n");
-  DEBUG(printSet(errs(), *ast));
-  delete ast;
+/*
+ * Verify if a given value has references after a call site.
+ */
+bool DeadStoreEliminationPass::isRefAfterCallSite(Value* v, CallSite &CS) {
+  BasicBlock* CSBB = CS.getInstruction()->getParent();
 
-  // Make AliasSetTracker with pointer arguments
-  AliasSetTracker* argAST = new AliasSetTracker(*AA);
-  for (Function::arg_iterator formalArgIter = F.arg_begin(); formalArgIter !=
-      F.arg_end(); ++formalArgIter) {
-    Value *formalArg = formalArgIter;
-    if (formalArg->getType()->isPointerTy()) {
-      argAST->add(formalArg, getPointerSize(formalArg, *AA), NULL);
+  // Collect basic blocks to inspect
+  std::vector<BasicBlock*> BBToInspect;
+  std::set<BasicBlock*> BBToInspectSet;
+  BBToInspect.push_back(CSBB);
+  BBToInspectSet.insert(CSBB);
+  for (unsigned int i = 0; i < BBToInspect.size(); ++i) {
+    BasicBlock* BB = BBToInspect.at(i);
+    TerminatorInst* terminator = BB->getTerminator();
+    if (terminator && terminator->getNumSuccessors() > 0) {
+      unsigned numSuccessors = terminator->getNumSuccessors();
+      for (unsigned i = 0; i < numSuccessors; ++i) {
+        // Collect successors
+        BasicBlock* successor = terminator->getSuccessor(i);
+        if (!BBToInspectSet.count(successor)) {
+          BBToInspect.push_back(successor);
+          BBToInspectSet.insert(successor);
+        }
+      }
     }
   }
 
-  // Verify if value alias args
-  ast = new AliasSetTracker(*AA);
-  ast->add(*argAST);
-  DEBUG(errs() << "    Adding value " << *v << ", with size " << getPointerSize(v, *AA) << "\n");
-  bool aliasArgs = !ast->add(v, getPointerSize(v, *AA), NULL);
-  DEBUG(errs() << "    Arguments+value AST:\n");
-  DEBUG(printSet(errs(), *ast));
-  delete ast;
-  delete argAST;
-
-  if (aliasArgs) DEBUG(errs() << "    Value " << *v << " cannot be removed due to alias args.\n");
-  if (aliasGlobals) DEBUG(errs() << "    Value " << *v << " cannot be removed due to alias globals.\n");
-
-  return (aliasArgs || aliasGlobals);
+  // Inspect if any instruction after CS references v
+  AliasAnalysis::Location loc(v, getPointerSize(v, *AA), NULL);
+  for (unsigned int i = 0; i < BBToInspect.size(); ++i) {
+    BasicBlock* BB = BBToInspect.at(i);
+    BasicBlock::iterator I = BB->begin();
+    if (BB == CSBB) {
+      Instruction* callInst = CS.getInstruction();
+      Instruction* inst;
+      do {
+        inst = I;
+        ++I;
+      } while (inst != callInst);
+    }
+    for (BasicBlock::iterator IE = BB->end(); I != IE; ++I) {
+      Instruction* inst = I;
+      AliasAnalysis::ModRefResult mrf = AA->getModRefInfo(inst, loc);
+      DEBUG(errs() << "Verifying if instruction " << *inst << " refs " << *v << ": ");
+      if (mrf == AliasAnalysis::Ref || mrf == AliasAnalysis::ModRef) {
+        DEBUG(errs() << mrf << "\n");
+        return true;
+      } else {
+        DEBUG(errs() << mrf << "\n");
+      }
+    }
+  }
+  return false;
 }
 
 /*
@@ -273,7 +319,7 @@ void DeadStoreEliminationPass::runOverwrittenDeadStoreAnalysisOnFn(Function &F) 
              //FIXME: be sure that the store on the caller fully overwrites the
              //store on the callee
              if (ptr == actualArg && storedArgs.count(formalArg)) {
-               DEBUG(errs() << "  Store on " << formalArg->getName() << " should be removed with cloning\n");
+               DEBUG(errs() << "  Store on " << formalArg->getName() << " will be removed with cloning\n");
                deadArguments[depInst].insert(formalArg);
              }
            }

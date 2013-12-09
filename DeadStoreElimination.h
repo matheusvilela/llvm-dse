@@ -28,9 +28,6 @@ namespace llvm {
     // Functions that store on arguments
     std::map<Function*, std::set<Value*> > fnThatStoreOnArgs;
 
-    // Global values AST
-    AliasSetTracker* globalsAST;
-
     // Arguments that have dead stores
     std::map< Instruction*, std::set<Value*> > deadArguments;
 
@@ -40,20 +37,24 @@ namespace llvm {
     AliasAnalysis *AA;
     MemoryDependenceAnalysis *MDA;
 
+    // VisitedPHIs - The set of PHI nodes visited when determining
+    /// if a variable's reference has been taken.  This set
+    /// is maintained to ensure we don't visit the same PHI node multiple
+    /// times.
+    SmallPtrSet<const PHINode*, 16> VisitedPHIs;
    public:
     static char ID;
 
     DeadStoreEliminationPass();
-    ~DeadStoreEliminationPass();
 
     Function* cloneFunctionWithoutDeadStore(Function *Fn, Instruction* caller, std::string suffix);
-    bool aliasExternalValues(Value *v, Function &F);
     bool changeLinkageTypes(Module &M);
     bool cloneFunctions();
+    bool hasAddressTaken(const Instruction *AI, CallSite& CS);
+    bool isRefAfterCallSite(Value* v, CallSite &CS);
     bool runOnModule(Module &M);
     int getFnThatStoreOnArgs(Module &M);
     virtual void getAnalysisUsage(AnalysisUsage &AU) const;
-    void getGlobalValuesInfo(Module &M);
     void print(raw_ostream &O, const Module *M) const;
     void printSet(raw_ostream &O, AliasSetTracker &myset) const;
     void replaceCallingInst(Instruction* caller, Function* fn);
