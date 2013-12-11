@@ -60,11 +60,11 @@ bool DeadStoreEliminationPass::changeLinkageTypes(Module &M) {
   for (Module::global_iterator git = M.global_begin(), gitE = M.global_end();
         git != gitE; ++git) {
     DEBUG(errs() << "  " << *git << "\n");
-    git->setLinkage(GlobalValue::PrivateLinkage);
+    if (!git->hasExternalLinkage() && !git->hasAppendingLinkage()) git->setLinkage(GlobalValue::PrivateLinkage);
   }
   for (Module::iterator F = M.begin(), E = M.end(); F != E; ++F) {
     if (!F->isDeclaration()) {
-      F->setLinkage(GlobalValue::PrivateLinkage);
+     if (!F->hasExternalLinkage() && !F->hasAppendingLinkage()) F->setLinkage(GlobalValue::PrivateLinkage);
       DEBUG(errs() << "  " << F->getName() << "\n");
     }
   }
