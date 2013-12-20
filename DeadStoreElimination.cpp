@@ -258,8 +258,8 @@ bool DeadStoreEliminationPass::isRefAfterCallSite(Value* v, CallSite &CS) {
     }
     for (BasicBlock::iterator IE = BB->end(); I != IE; ++I) {
       Instruction* inst = I;
-      AliasAnalysis::ModRefResult mrf = AA->getModRefInfo(inst, loc);
       DEBUG(errs() << "Verifying if instruction " << *inst << " refs " << *v << ": ");
+      AliasAnalysis::ModRefResult mrf = AA->getModRefInfo(inst, loc);
       if (mrf == AliasAnalysis::Ref || mrf == AliasAnalysis::ModRef) {
         DEBUG(errs() << mrf << "\n");
         return true;
@@ -318,6 +318,7 @@ void DeadStoreEliminationPass::runOverwrittenDeadStoreAnalysisOnFn(Function &F) 
              Value *actualArg = *actualArgIter;
              if (ptr == actualArg && storedArgs.count(formalArg)) {
                int64_t InstWriteOffset, DepWriteOffset;
+               DEBUG(errs() << "  Verifying if store is completely overwritten.\n");
                AliasAnalysis::Location Loc(ptr, getPointerSize(ptr, *AA), NULL);
                AliasAnalysis::Location DepLoc(actualArg, getPointerSize(actualArg, *AA), NULL);
                OverwriteResult OR = isOverwrite(Loc, DepLoc, *AA, DepWriteOffset, InstWriteOffset);
