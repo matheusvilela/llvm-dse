@@ -260,11 +260,9 @@ bool DeadStoreEliminationPass::isRefAfterCallSite(Value* v, CallSite &CS) {
       Instruction* inst = I;
       DEBUG(errs() << "Verifying if instruction " << *inst << " refs " << *v << ": ");
       AliasAnalysis::ModRefResult mrf = AA->getModRefInfo(inst, loc);
+      DEBUG(errs() << mrf << "\n");
       if (mrf == AliasAnalysis::Ref || mrf == AliasAnalysis::ModRef) {
-        DEBUG(errs() << mrf << "\n");
         return true;
-      } else {
-        DEBUG(errs() << mrf << "\n");
       }
     }
   }
