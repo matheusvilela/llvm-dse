@@ -1,7 +1,5 @@
 #undef  DEBUG_TYPE
 #define DEBUG_TYPE "dead-store-elimination"
-#define __STDC_LIMIT_MACROS
-#define __STDC_CONSTANT_MACROS
 #include <sstream>
 #include <set>
 

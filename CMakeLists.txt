@@ -1,4 +1,4 @@
-add_llvm_loadable_module( LLVMDSE
+add_llvm_loadable_module(CBODSE
    DeadStoreElimination.h
    DeadStoreElimination.cpp
   )
